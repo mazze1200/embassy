@@ -368,6 +368,26 @@ impl<'d, T: Instance> Fdcan<'d, T> {
         )
     }
 
+    /// Split instance into separate Tx(write) and Rx(read) portions
+    pub fn split_with_control(self) -> (FdcanTx<'d, T>, FdcanRx<'d, T>, FdcanControl<T>) {
+        (
+            FdcanTx {
+                config: self.config,
+                _instance: self.instance,
+                _mode: self._mode,
+            },
+            FdcanRx {
+                _instance1: PhantomData::<T>,
+                _instance2: T::regs(),
+                _mode: self._mode,
+            },
+            FdcanControl {
+                config: self.config,
+                _instance1: PhantomData::<T>,
+            },
+        )
+    }
+
     /// Join split rx and tx portions back together
     pub fn join(tx: FdcanTx<'d, T>, rx: FdcanRx<'d, T>) -> Self {
         Fdcan {
@@ -645,6 +665,53 @@ pub struct FdcanTx<'d, T: Instance> {
     config: crate::can::fd::config::FdCanConfig,
     _instance: FdcanInstance<'d, T>, //(PeripheralRef<'a, T>);
     _mode: FdcanOperatingMode,
+}
+
+/// FDCAN control only Instance
+pub struct FdcanControl<T: Instance> {
+    config: crate::can::fd::config::FdCanConfig,
+    _instance1: PhantomData<T>,
+}
+
+impl<'c, T: Instance> FdcanControl<T> {
+    /// Configures the bit timings calculated from supplied bitrate.
+    pub fn set_bitrate(&mut self, normal_bit_timing: crate::can::fd::config::NominalBitTiming) {
+        self.config = self.config.set_nominal_bit_timing(normal_bit_timing);
+    }
+
+    /// Configures the bit timings for VBR data calculated from supplied bitrate. This also sets confit to allow can FD and VBR
+    pub fn set_fd_data_bitrate(&mut self, data_normal_bit_timing: crate::can::fd::config::DataBitTiming) {
+        self.config.frame_transmit = FrameTransmissionConfig::AllowFdCanAndBRS;
+        self.config = self.config.set_data_bit_timing(data_normal_bit_timing);
+    }
+
+    /// Set device into config mode
+    pub fn into_config_mode(&mut self) {
+        let ns_per_timer_tick = calc_ns_per_timer_tick::<T>(self.config.frame_transmit);
+        critical_section::with(|_| unsafe {
+            T::mut_state().ns_per_timer_tick = ns_per_timer_tick;
+        });
+        T::registers().into_mode(self.config, FdcanOperatingMode::InternalLoopbackMode);
+    }
+
+    /// Get can config
+    pub fn get_config(&self) -> FdCanConfig {
+        self.config.clone()
+    }
+
+    /// Get can peripherial frequency
+    pub fn get_frequency(&self) -> crate::time::Hertz {
+        T::frequency()
+    }
+
+    /// Start in mode.
+    pub fn start(&mut self, mode: FdcanOperatingMode) {
+        let ns_per_timer_tick = calc_ns_per_timer_tick::<T>(self.config.frame_transmit);
+        critical_section::with(|_| unsafe {
+            T::mut_state().ns_per_timer_tick = ns_per_timer_tick;
+        });
+        T::registers().into_mode(self.config, mode);
+    }
 }
 
 impl<'c, 'd, T: Instance> FdcanTx<'d, T> {
