@@ -410,3 +410,43 @@ impl CanHeader for FdFrame {
         self.header()
     }
 }
+
+/// Frame with up to 8 bytes of data payload as per Fd CAN
+#[derive(Debug, Copy, Clone)]
+pub struct TxEvent {
+    can_header: Header,
+    marker: Option<u8>,
+    timestamp: u16,
+}
+
+impl TxEvent {
+
+    /// Creates a new TxEvent  
+    pub fn new(can_header: Header, marker: Option<u8>, timestamp: u16) -> Self {
+        TxEvent {
+            can_header,
+            marker,
+            timestamp,
+        }
+    }
+
+    /// Get reference to data
+    pub fn header(&self) -> &Header {
+        &self.can_header
+    }
+
+    /// Return ID
+    pub fn id(&self) -> &embedded_can::Id {
+        &self.can_header.id
+    }
+
+    /// Get reference to data
+    pub fn marker(&self) -> &Option<u8> {
+        &self.marker
+    } 
+
+    /// Get reference to data
+    pub fn timestamp(&self) -> &u16 {
+        &self.timestamp
+    }    
+}

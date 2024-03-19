@@ -5,6 +5,7 @@
 #![allow(unused)]
 
 use super::common::{BRS_R, DLC_R, ESI_R, RTR_R, XTD_R};
+use super::enums::{DataLength, FrameFormat};
 use super::generic;
 
 #[doc = "Reader of register TxEventElement"]
@@ -134,5 +135,36 @@ impl R {
     #[inline(always)]
     pub fn mm(&self) -> MM_R {
         MM_R::new(((self.bits[1] >> 24) & 0xFF) as u8)
+    }
+    pub fn to_data_length(&self) -> DataLength {
+        let dlc = self.dlc().bits();
+        let ff = match self.edl().data_length_format() {
+            // Despite the name, this flag not only tells the DLC format 
+            // but also the CRC format, so it can reliably be used to 
+            // distingish FD frames from Standard / Classic frames
+            DataLengthFormat::FDCANLength => FrameFormat::Fdcan,
+            DataLengthFormat::StandardLength => FrameFormat::Classic
+        };
+        let len = if ff == FrameFormat::Fdcan {
+            // See RM0433 Rev 7 Table 475. DLC coding
+            match dlc {
+                0..=8 => dlc,
+                9 => 12,
+                10 => 16,
+                11 => 20,
+                12 => 24,
+                13 => 32,
+                14 => 48,
+                15 => 64,
+                _ => panic!("DLC > 15"),
+            }
+        } else {
+            match dlc {
+                0..=8 => dlc,
+                9..=15 => 8,
+                _ => panic!("DLC > 15"),
+            }
+        };
+        DataLength::new(len, ff)
     }
 }

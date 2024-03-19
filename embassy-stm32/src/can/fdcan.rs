@@ -6,6 +6,7 @@ use core::task::Poll;
 use embassy_hal_internal::{into_ref, PeripheralRef};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_time::Instant;
 
 use crate::can::fd::peripheral::Registers;
 use crate::gpio::sealed::AFType;
@@ -23,6 +24,8 @@ use fd::config::*;
 use fd::filter::*;
 pub use fd::{config, filter};
 use frame::*;
+
+use self::fd::message_ram::enums::Event;
 
 /// Timestamp for incoming packets. Use Embassy time when enabled.
 #[cfg(feature = "time")]
@@ -49,7 +52,11 @@ impl<T: Instance> interrupt::typelevel::Handler<T::IT0Interrupt> for IT0Interrup
                 regs.ir().write(|w| w.set_tc(true));
             }
             if ir.tefn() {
+                // Tx event FIFO new entry
                 regs.ir().write(|w| w.set_tefn(true));
+                match &T::state().tx_event_mode {
+                    sealed::TxEventMode::NonBuffered(waker) => waker.wake(),
+                };
             }
 
             match &T::state().tx_mode {
@@ -58,7 +65,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::IT0Interrupt> for IT0Interrup
                     if !T::registers().tx_queue_is_full() {
                         match buf.tx_receiver.try_receive() {
                             Ok(frame) => {
-                                _ = T::registers().write(&frame);
+                                _ = T::registers().write(&frame, Event::NoEvent);
                             }
                             Err(_) => {}
                         }
@@ -68,7 +75,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::IT0Interrupt> for IT0Interrup
                     if !T::registers().tx_queue_is_full() {
                         match buf.tx_receiver.try_receive() {
                             Ok(frame) => {
-                                _ = T::registers().write(&frame);
+                                _ = T::registers().write(&frame, Event::NoEvent);
                             }
                             Err(_) => {}
                         }
@@ -369,7 +376,7 @@ impl<'d, T: Instance> Fdcan<'d, T> {
     }
 
     /// Split instance into separate Tx(write) and Rx(read) portions
-    pub fn split_with_control(self) -> (FdcanTx<'d, T>, FdcanRx<'d, T>, FdcanControl<T>) {
+    pub fn split_with_control(self) -> (FdcanTx<'d, T>, FdcanRx<'d, T>, FdcanTxEvent<T>, FdcanControl<T>) {
         (
             FdcanTx {
                 config: self.config,
@@ -379,6 +386,10 @@ impl<'d, T: Instance> Fdcan<'d, T> {
             FdcanRx {
                 _instance1: PhantomData::<T>,
                 _instance2: T::regs(),
+                _mode: self._mode,
+            },
+            FdcanTxEvent {
+                _instance: PhantomData::<T>,
                 _mode: self._mode,
             },
             FdcanControl {
@@ -667,6 +678,19 @@ pub struct FdcanTx<'d, T: Instance> {
     _mode: FdcanOperatingMode,
 }
 
+/// FDCAN Tx Event only Instance
+pub struct FdcanTxEvent<T: Instance> {
+    _instance: PhantomData<T>, //(PeripheralRef<'a, T>);
+    _mode: FdcanOperatingMode,
+}
+
+impl<'c, T: Instance> FdcanTxEvent<T> {
+    /// Read the next Tx Event from the FIFO or waits until the next Event is avaialbe and returns this.
+    pub async fn read_tx_event(&mut self) -> (Header, u8, Instant) {
+        T::state().tx_event_mode.read_tx_event::<T>().await
+    }
+}
+
 /// FDCAN control only Instance
 pub struct FdcanControl<T: Instance> {
     config: crate::can::fd::config::FdCanConfig,
@@ -723,12 +747,24 @@ impl<'c, 'd, T: Instance> FdcanTx<'d, T> {
         T::state().tx_mode.write::<T>(frame).await
     }
 
+    /// Same as write but with the option for a marker which will be coptied to the
+    /// respective Tx Event message as soon as this message has been send.
+    pub async fn write_with_marker(&mut self, frame: &ClassicFrame, marker: Option<u8>) -> Option<ClassicFrame> {
+        T::state().tx_mode.write_with_marker::<T>(frame, marker).await
+    }
+
     /// Queues the message to be sent but exerts backpressure.  If a lower-priority
     /// frame is dropped from the mailbox, it is returned.  If no lower-priority frames
     /// can be replaced, this call asynchronously waits for a frame to be successfully
     /// transmitted, then tries again.
     pub async fn write_fd(&mut self, frame: &FdFrame) -> Option<FdFrame> {
         T::state().tx_mode.write_fd::<T>(frame).await
+    }
+
+    /// Same as write_fd but with the option for a marker which will be coptied to the
+    /// respective Tx Event message as soon as this message has been send.
+    pub async fn write_fd_with_marker(&mut self, frame: &FdFrame, marker: Option<u8>) -> Option<FdFrame> {
+        T::state().tx_mode.write_fd_with_marker::<T>(frame, marker).await
     }
 }
 
@@ -751,7 +787,8 @@ pub(crate) mod sealed {
     use embassy_sync::channel::{DynamicReceiver, DynamicSender};
     use embassy_sync::waitqueue::AtomicWaker;
 
-    use super::CanHeader;
+    use super::fd::message_ram::enums::Event;
+    use super::{CanHeader, Header};
     use crate::can::_version::{BusError, Timestamp};
     use crate::can::frame::{ClassicFrame, FdFrame};
 
@@ -767,6 +804,45 @@ pub(crate) mod sealed {
     }
     pub struct FdBufferedTxInner {
         pub tx_receiver: DynamicReceiver<'static, FdFrame>,
+    }
+
+    pub enum TxEventMode {
+        NonBuffered(AtomicWaker),
+    }
+
+    impl TxEventMode {
+        pub fn register(&self, arg: &core::task::Waker) {
+            match self {
+                TxEventMode::NonBuffered(waker) => waker.register(arg),
+            }
+        }
+
+        pub fn on_interrupt<T: Instance>(&self, fifonr: usize) {
+            T::regs().ir().write(|w| w.set_rfn(fifonr, true));
+            match self {
+                TxEventMode::NonBuffered(waker) => {
+                    waker.wake();
+                }
+            }
+        }
+
+        async fn read_async<T: Instance>(&self) -> (Header, u8, Timestamp) {
+            poll_fn(|cx| {
+                T::state().err_waker.register(cx.waker());
+                self.register(cx.waker());
+                match T::registers().read_tx_event() {
+                    Some((header, marker, ts)) => {
+                        Poll::Ready((header, marker, T::calc_timestamp(T::state().ns_per_timer_tick, ts)))
+                    }
+                    None => Poll::Pending,
+                }
+            })
+            .await
+        }
+
+        pub async fn read_tx_event<T: Instance>(&self) -> (Header, u8, Timestamp) {
+            self.read_async::<T>().await
+        }
     }
 
     pub enum RxMode {
@@ -862,11 +938,15 @@ pub(crate) mod sealed {
         /// frame is dropped from the mailbox, it is returned.  If no lower-priority frames
         /// can be replaced, this call asynchronously waits for a frame to be successfully
         /// transmitted, then tries again.
-        async fn write_generic<T: Instance, F: embedded_can::Frame + CanHeader>(&self, frame: &F) -> Option<F> {
+        async fn write_generic_marker<T: Instance, F: embedded_can::Frame + CanHeader>(
+            &self,
+            frame: &F,
+            marker: Event,
+        ) -> Option<F> {
             poll_fn(|cx| {
                 self.register(cx.waker());
 
-                if let Ok(dropped) = T::registers().write(frame) {
+                if let Ok(dropped) = T::registers().write(frame, marker) {
                     return Poll::Ready(dropped);
                 }
 
@@ -882,7 +962,16 @@ pub(crate) mod sealed {
         /// can be replaced, this call asynchronously waits for a frame to be successfully
         /// transmitted, then tries again.
         pub async fn write<T: Instance>(&self, frame: &ClassicFrame) -> Option<ClassicFrame> {
-            self.write_generic::<T, _>(frame).await
+            self.write_generic_marker::<T, _>(frame, Event::NoEvent).await
+        }
+
+        /// CLassic can with marker
+        pub async fn write_with_marker<T: Instance>(
+            &self,
+            frame: &ClassicFrame,
+            marker: Option<u8>,
+        ) -> Option<ClassicFrame> {
+            self.write_generic_marker::<T, _>(frame, marker.into()).await
         }
 
         /// Queues the message to be sent but exerts backpressure.  If a lower-priority
@@ -890,13 +979,19 @@ pub(crate) mod sealed {
         /// can be replaced, this call asynchronously waits for a frame to be successfully
         /// transmitted, then tries again.
         pub async fn write_fd<T: Instance>(&self, frame: &FdFrame) -> Option<FdFrame> {
-            self.write_generic::<T, _>(frame).await
+            self.write_generic_marker::<T, _>(frame, Event::NoEvent).await
+        }
+
+        /// write fd with marker
+        pub async fn write_fd_with_marker<T: Instance>(&self, frame: &FdFrame, marker: Option<u8>) -> Option<FdFrame> {
+            self.write_generic_marker::<T, _>(frame, marker.into()).await
         }
     }
 
     pub struct State {
         pub rx_mode: RxMode,
         pub tx_mode: TxMode,
+        pub tx_event_mode: TxEventMode,
         pub ns_per_timer_tick: u64,
 
         pub err_waker: AtomicWaker,
@@ -907,6 +1002,7 @@ pub(crate) mod sealed {
             Self {
                 rx_mode: RxMode::NonBuffered(AtomicWaker::new()),
                 tx_mode: TxMode::NonBuffered(AtomicWaker::new()),
+                tx_event_mode: TxEventMode::NonBuffered(AtomicWaker::new()),
                 ns_per_timer_tick: 0,
                 err_waker: AtomicWaker::new(),
             }

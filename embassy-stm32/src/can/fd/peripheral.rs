@@ -11,6 +11,8 @@ use crate::can::fd::message_ram::enums::*;
 use crate::can::fd::message_ram::{RegisterBlock, RxFifoElement, TxBufferElement};
 use crate::can::frame::*;
 
+use super::message_ram::TxEventElement;
+
 /// Loopback Mode
 #[derive(Clone, Copy, Debug)]
 enum LoopbackMode {
@@ -29,6 +31,11 @@ impl Registers {
     fn tx_buffer_element(&self, bufidx: usize) -> &mut TxBufferElement {
         &mut self.msg_ram_mut().transmit.tbsa[bufidx]
     }
+
+    fn tx_event_element(&self, bufidx: usize) -> &mut TxEventElement {
+        &mut self.msg_ram_mut().transmit.efsa[bufidx]
+    }
+
     pub fn msg_ram_mut(&self) -> &mut RegisterBlock {
         #[cfg(stm32h7)]
         let ptr = self.msgram.ram(self.msg_ram_offset / 4).as_ptr() as *mut RegisterBlock;
@@ -41,6 +48,22 @@ impl Registers {
 
     fn rx_fifo_element(&self, fifonr: usize, bufnum: usize) -> &mut RxFifoElement {
         &mut self.msg_ram_mut().receive[fifonr].fxsa[bufnum]
+    }
+
+    pub fn read_tx_event(&self) -> Option<(Header, u8, u16)> {
+        if self.regs.txefs().read().effl() < 1 {
+            return None;
+        }
+
+        let read_idx = self.regs.txefs().read().efgi();
+        let tx_event_element = self.tx_event_element(read_idx as usize);
+        
+        let maybe_header = extract_tx_event(tx_event_element);
+
+        // Clear Tx Event FIFO, reduces count and increments read buf
+        self.regs.txefa().modify(|w| w.set_efai(read_idx));
+
+        maybe_header
     }
 
     pub fn read<F: CanHeader>(&self, fifonr: usize) -> Option<(F, u16)> {
@@ -70,11 +93,11 @@ impl Registers {
         }
     }
 
-    pub fn put_tx_frame(&self, bufidx: usize, header: &Header, buffer: &[u8]) {
+    pub fn put_tx_frame(&self, bufidx: usize, header: &Header, buffer: &[u8], marker: Event) {
         let mailbox = self.tx_buffer_element(bufidx);
 
         mailbox.reset();
-        put_tx_header(mailbox, header);
+        put_tx_header(mailbox, header, marker);
         put_tx_data(mailbox, &buffer[..header.len() as usize]);
 
         // Set <idx as Mailbox> as ready to transmit
@@ -211,7 +234,11 @@ impl Registers {
         }
     }
 
-    pub fn write<F: embedded_can::Frame + CanHeader>(&self, frame: &F) -> nb::Result<Option<F>, Infallible> {
+    pub fn write<F: embedded_can::Frame + CanHeader>(
+        &self,
+        frame: &F,
+        marker: Event,
+    ) -> nb::Result<Option<F>, Infallible> {
         let (idx, pending_frame) = if self.tx_queue_is_full() {
             if self.tx_queue_mode() == TxBufferMode::Fifo {
                 // Does not make sense to cancel a pending frame when using FIFO
@@ -238,7 +265,7 @@ impl Registers {
             (idx, None)
         };
 
-        self.put_tx_frame(idx as usize, frame.header(), frame.data());
+        self.put_tx_frame(idx as usize, frame.header(), frame.data(), marker);
 
         Ok(pending_frame)
     }
@@ -708,7 +735,7 @@ fn make_id(id: u32, extended: bool) -> embedded_can::Id {
     }
 }
 
-fn put_tx_header(mailbox: &mut TxBufferElement, header: &Header) {
+fn put_tx_header(mailbox: &mut TxBufferElement, header: &Header, marker: Event) {
     let (id, id_type) = match header.id() {
         // A standard identifier has to be written to ID[28:18].
         embedded_can::Id::Standard(id) => ((id.as_raw() as u32) << 18, IdType::StandardId),
@@ -730,7 +757,7 @@ fn put_tx_header(mailbox: &mut TxBufferElement, header: &Header) {
             .xtd()
             .set_id_type(id_type)
             .set_len(DataLength::new(header.len(), frame_format))
-            .set_event(Event::NoEvent)
+            .set_event(marker)
             .fdf()
             .set_format(frame_format)
             .brs()
@@ -793,4 +820,23 @@ fn extract_frame(mailbox: &RxFifoElement, buffer: &mut [u8]) -> Option<(Header, 
         Header::new(id, dlc, header_reg.rtr().bits())
     };
     Some((header, timestamp))
+}
+
+fn extract_tx_event(tx_event: &TxEventElement) -> Option<(Header, u8, u16)> {
+    let header_reg = tx_event.read();
+
+    let id = make_id(header_reg.id().bits(), header_reg.xtd().bits());
+    let data_length = header_reg.to_data_length();
+    let len = data_length.len();
+    let timestamp = header_reg.txts().bits;
+    let marker = header_reg.mm().bits();
+
+    match data_length {
+        DataLength::Classic(_) => Some((Header::new(id, len, header_reg.rtr().bits()), marker, timestamp)),
+        DataLength::Fdcan(_) => Some((
+            Header::new_fd(id, len, header_reg.rtr().bits(), header_reg.brs().bits()),
+            marker,
+            timestamp,
+        )),
+    }
 }
