@@ -12,7 +12,7 @@ use crate::can::fd::peripheral::Registers;
 use crate::gpio::sealed::AFType;
 use crate::interrupt::typelevel::Interrupt;
 use crate::rcc::RccPeripheral;
-use crate::{interrupt, time, Peripheral};
+use crate::{interrupt, peripherals, time, Peripheral};
 
 pub mod enums;
 pub(crate) mod fd;
@@ -166,9 +166,25 @@ fn calc_ns_per_timer_tick<T: Instance>(mode: crate::can::fd::config::FrameTransm
                 ({ T::regs().nbtp().read().nbrp() } + 1) as u64 * ({ T::regs().tscc().read().tcp() } + 1) as u64;
             1_000_000_000 as u64 / (freq.0 as u64 * prescale)
         }
-        // For VBR this is too hard because the FDCAN timer switches clock rate you need to configure to use
-        // timer3 instead which is too hard to do from this module.
-        _ => 1_000,
+        // For VBR TIM3 has to be used to get a consistent time base.
+        _ => {
+            let regs = <crate::peripherals::TIM3 as crate::timer::low_level::GeneralPurpose16bitInstance>::regs_gp16();
+            if regs.cr1().read().cen() {
+                if regs.arr().read().arr() == 0xffff {
+                    let core_frequency =
+                        <peripherals::TIM3 as crate::rcc::low_level::RccPeripheral>::frequency().0 as u64;
+                    let timer_clock_frequency = core_frequency / (regs.psc().read().psc() + 1) as u64;
+
+                    1_000_000_000u64 / timer_clock_frequency
+                } else {
+                    warn!("TIM3 ARR is not 0xffff, which is mandatory to be used as FDCAN time source");
+                    0
+                }
+            } else {
+                warn!("TIM3 is not enabled. Thus cannot be used as FDCAN time source");
+                0
+            }
+        }
     }
 }
 
