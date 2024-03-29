@@ -57,7 +57,7 @@ impl Registers {
 
         let read_idx = self.regs.txefs().read().efgi();
         let tx_event_element = self.tx_event_element(read_idx as usize);
-        
+
         let maybe_header = extract_tx_event(tx_event_element);
 
         // Clear Tx Event FIFO, reduces count and increments read buf
@@ -397,7 +397,7 @@ impl Registers {
             .tscc()
             .write(|w| w.set_tss(stm32_metapac::can::vals::Tss::INCREMENT));
         #[cfg(stm32h7)]
-        self.regs.tscc().write(|w| w.set_tss(0x01));
+        self.set_timestamp_counter_source(TimestampSource::FromTIM3);
 
         // this isn't really documented in the reference manual
         // but corresponding txbtie bit has to be set for the TC (TxComplete) interrupt to fire
