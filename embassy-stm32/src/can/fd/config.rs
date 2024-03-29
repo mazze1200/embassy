@@ -15,7 +15,9 @@ use core::num::{NonZeroU16, NonZeroU8};
 ///
 /// Then copy the `CAN_BUS_TIME` register value from the table and pass it as the `btr`
 /// parameter to this method.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+
 pub struct NominalBitTiming {
     /// Value by which the oscillator frequency is divided for generating the bit time quanta. The bit
     /// time is built up from a multiple of this quanta. Valid values are 1 to 512.
@@ -62,7 +64,9 @@ impl Default for NominalBitTiming {
 
 /// Configures the data bit timings for the FdCan Variable Bitrates.
 /// This is not used when frame_transmit is set to anything other than AllowFdCanAndBRS.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug,PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+
 pub struct DataBitTiming {
     /// Tranceiver Delay Compensation
     pub transceiver_delay_compensation: bool,
@@ -366,11 +370,23 @@ impl FdCanConfig {
         self
     }
 
+    /// Retreive normal bit timings.
+    #[inline]
+    pub const fn get_nominal_bit_timing(&self ) -> NominalBitTiming {
+        self.nbtr
+    }
+
     /// Configures the bit timings.
     #[inline]
     pub const fn set_data_bit_timing(mut self, btr: DataBitTiming) -> Self {
         self.dbtr = btr;
         self
+    }
+    
+    /// Retreive data bit timings.
+    #[inline]
+    pub const fn get_data_bit_timing(&self) -> DataBitTiming {
+        self.dbtr
     }
 
     /// Enables or disables automatic retransmission of messages
