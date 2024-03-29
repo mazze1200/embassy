@@ -12,7 +12,7 @@ use crate::can::fd::peripheral::Registers;
 use crate::gpio::sealed::AFType;
 use crate::interrupt::typelevel::Interrupt;
 use crate::rcc::RccPeripheral;
-use crate::{interrupt, peripherals, Peripheral};
+use crate::{interrupt, time, Peripheral};
 
 pub mod enums;
 pub(crate) mod fd;
@@ -168,7 +168,7 @@ fn calc_ns_per_timer_tick<T: Instance>(mode: crate::can::fd::config::FrameTransm
         }
         // For VBR this is too hard because the FDCAN timer switches clock rate you need to configure to use
         // timer3 instead which is too hard to do from this module.
-        _ => 0,
+        _ => 1_000,
     }
 }
 
@@ -692,25 +692,47 @@ impl<'c, T: Instance> FdcanTxEvent<T> {
 }
 
 /// FDCAN control only Instance
-pub struct FdcanControl<T: Instance> {
+pub struct FdcanControl<T: Instance + ?Sized> {
     config: crate::can::fd::config::FdCanConfig,
     _instance1: PhantomData<T>,
 }
 
-impl<'c, T: Instance> FdcanControl<T> {
+pub trait FdCanConfiguration {
+    fn set_bitrate(&mut self, normal_bit_timing: crate::can::fd::config::NominalBitTiming);
+
+    /// Configures the bit timings for VBR data calculated from supplied bitrate. This also sets confit to allow can FD and VBR
+    fn set_fd_data_bitrate(&mut self, data_normal_bit_timing: crate::can::fd::config::DataBitTiming);
+
+    /// Set device into config mode
+    fn into_config_mode(&mut self);
+
+    /// Get can config
+    fn get_config(&self) -> FdCanConfig;
+
+    /// Get can peripherial frequency
+    fn get_frequency(&self) -> crate::time::Hertz;
+
+    /// Get the current timestamp of the CAN channel.
+    fn get_timestamp(&self) -> Instant;
+
+    /// Start in mode.
+    fn start(&mut self, mode: FdcanOperatingMode);
+}
+
+impl<'c, T: Instance> FdCanConfiguration for FdcanControl<T> {
     /// Configures the bit timings calculated from supplied bitrate.
-    pub fn set_bitrate(&mut self, normal_bit_timing: crate::can::fd::config::NominalBitTiming) {
+    fn set_bitrate(&mut self, normal_bit_timing: crate::can::fd::config::NominalBitTiming) {
         self.config = self.config.set_nominal_bit_timing(normal_bit_timing);
     }
 
     /// Configures the bit timings for VBR data calculated from supplied bitrate. This also sets confit to allow can FD and VBR
-    pub fn set_fd_data_bitrate(&mut self, data_normal_bit_timing: crate::can::fd::config::DataBitTiming) {
+    fn set_fd_data_bitrate(&mut self, data_normal_bit_timing: crate::can::fd::config::DataBitTiming) {
         self.config.frame_transmit = FrameTransmissionConfig::AllowFdCanAndBRS;
         self.config = self.config.set_data_bit_timing(data_normal_bit_timing);
     }
 
     /// Set device into config mode
-    pub fn into_config_mode(&mut self) {
+    fn into_config_mode(&mut self) {
         let ns_per_timer_tick = calc_ns_per_timer_tick::<T>(self.config.frame_transmit);
         critical_section::with(|_| unsafe {
             T::mut_state().ns_per_timer_tick = ns_per_timer_tick;
@@ -719,22 +741,26 @@ impl<'c, T: Instance> FdcanControl<T> {
     }
 
     /// Get can config
-    pub fn get_config(&self) -> FdCanConfig {
+    fn get_config(&self) -> FdCanConfig {
         self.config.clone()
     }
 
     /// Get can peripherial frequency
-    pub fn get_frequency(&self) -> crate::time::Hertz {
+    fn get_frequency(&self) -> crate::time::Hertz {
         T::frequency()
     }
 
     /// Start in mode.
-    pub fn start(&mut self, mode: FdcanOperatingMode) {
+    fn start(&mut self, mode: FdcanOperatingMode) {
         let ns_per_timer_tick = calc_ns_per_timer_tick::<T>(self.config.frame_transmit);
         critical_section::with(|_| unsafe {
             T::mut_state().ns_per_timer_tick = ns_per_timer_tick;
         });
         T::registers().into_mode(self.config, mode);
+    }
+
+    fn get_timestamp(&self) -> Instant {
+        T::calc_timestamp(T::state().ns_per_timer_tick, T::regs().tscv().read().tsc())
     }
 }
 
