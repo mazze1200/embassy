@@ -232,6 +232,16 @@ impl<'d, T: Instance> FdcanConfigurator<'d, T> {
         return self.config;
     }
 
+    /// Get the transmission mode of the TX buffer (Fifo or accoding CAN message priority)
+    pub fn tx_mode(&self) -> TxBufferMode {
+        self.config.tx_buffer_mode
+    }
+
+    /// Set the transmission mode of the TX buffer (Fifo or accoding CAN message priority)
+    pub fn set_tx_mode(&mut self, tx_mode: TxBufferMode) {
+        self.config.tx_buffer_mode = tx_mode;
+    }
+
     /// Set configuration
     pub fn set_config(&mut self, config: crate::can::fd::config::FdCanConfig) {
         self.config = config;
